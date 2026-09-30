@@ -46,8 +46,7 @@
   raz przy starcie tak, zeby zakres byl jak najblizej jego srodka; potem
   bramka, ASK i APWR stoja w miejscu - bez przestrajania PLL i bez przerw.
 
-  Audio: audio/make_audio_h.py (tu: audio/osr_kobieta.wav, fragment
-  OSR_us_000_0010_8k.wav z Open Speech Repository).
+  Audio: audio/make_audio_h.py (tu: audio/sp8esa.mp3).
 
   UWAGA: dlugie ciagle TX mocno grzeje uklad - nie zostawiaj bez nadzoru.
 */
