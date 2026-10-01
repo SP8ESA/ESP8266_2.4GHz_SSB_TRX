@@ -147,6 +147,105 @@ python3 rx_iq.py --snap --ch 1 --n 255                        # 1024 pomiary prz
 python3 rx_iq.py --f 2400.25 --k 10 --seconds 10 --dc         # LO poza kanałem (np. QO-100)
 ```
 
+## Wzmocnienie odbiornika (`GAIN`, suwaki w `esp_sdr.py`)
+
+Sprzętowe AGC Wi‑Fi steruje dwoma polami na wewnętrznej magistrali PBUS:
+
+| pole | co to jest | zakres |
+|---|---|---|
+| PBUS(3,1), 7 bitów | stopień RF (LNA/mieszacz) | `rf` 0..6 → 0x00, 0x40, 0x60, 0x70, 0x78, 0x7C, 0x7F; szum −14 → +6 dB (ok. 21 dB) |
+| PBUS(3,2), bity 5..3 | VGA pasma podstawowego | `vga` 0..7, razem ok. 1 dB |
+
+AGC bez sygnału ustawia rf 2 / vga 2, przy silnym sygnale rf 0 / vga 5.
+Ręczne ustawienie wymaga trybu debug PBUS, w którym AGC nie może zmieniać
+pól:
+- **Wejście w tryb debug:** `rom_pbus_debugmode` (`0x4000737C`). Odbiór
+  zostaje włączony.
+- **Zapis pól:** tylko PBUS(3,1) i (3,2), przez `rom_pbus_force_test`
+  (`0x4000747C`). Odczyt PBUS: `rom_pbus_rd` (`0x400074D8`).
+- **Powrót do AGC:** `rom_pbus_workmode` (`0x40007648`).
+
+Czego nie używać:
+- **`rom_pbus_enter_debugmode`:** to tryb debug + `xpd_rx_off` + TX, ADC
+  staje.
+- **`rom_pbus_set_rxgain`:** przepisuje też PBUS(2,1), czyli włączniki toru
+  RX (w odbiorze 0x1FE: bit 6 to LNA, bit 7 mieszacz/bufor LO, bit 8 cały tor
+  pasma podstawowego), i gasi LNA. Silna nośna przez kabel i tak przechodzi,
+  więc test na niej wprowadza w błąd.
+- **`rom_pbus_exit_debugmode`:** robi „TX off” i zostawia PBUS(2,1) = 0x184.
+
+Komenda `GAIN AGC | GAIN rf vga`. W strumieniu (`IQSTREAM`, `IQLIF`)
+bajt 0xFF włącza AGC, a 0x80 | rf<<3 | vga ustawia wzmocnienie ręcznie, bez
+przerwy w strumieniu. Na słabym SSB z HackRF S/N wynosi 29–32 dB na każdym
+kroku rf. AGC na starcie dało tylko 20 dB. Po powrocie na AGC zostaje
+ostatnie ręczne wzmocnienie, dopóki AGC samo go nie zmieni.
+
+## Low-IF (`IQLIF f [if [D]]`)
+
+Zero-IF ma na środku kreskę DC, garb szumu 1/f ok. ±3 kHz i spury
+±1.1 kHz. W `IQLIF` LO z PLL stoi o `if` (domyślnie 100 kHz, ±20..400 kHz)
+obok, a resztę robi ESP:
+- **Estymator:** okno 32 próbek ADC (0.8 µs), sterowany wprost rejestrem
+  `0x6000057C`. Kolejno: start (bit 1), obróbka poprzedniej próbki w czasie
+  pomiaru (gotowość po ok. 1.2 µs), odczyt sum. Daje ok. 500 kS/s.
+- **Przy ROM:** okres wynosi 2.6 µs. Przy bezpośrednim sterowaniu 1.8 µs,
+  z czego sprzęt dokłada tylko ok. 0.4 µs ponad okno.
+- **Na CPU (pętla w IRAM):**
+  1. odjęcie DC (IIR);
+  2. mnożenie przez exp(−j·2π·f_nco·t), gdzie fazę liczy się z ccount
+     (CPU i ADC mają wspólny kwarc, więc nierówne odstępy próbek nie psują
+     fazy), a sin/cos bierze z tablicy 1024 punktów;
+  3. CIC 2. rzędu z decymacją ÷D (D = 15 daje ok. 33.5 kS/s).
+- **Wyjście:** paczki jak w `IQSTREAM`.
+- **Nowe NCO bez przerwy:** bajt 0xFE + 4 bajty K (int32 LE),
+  f_nco = K · 160 MHz / 2³².
+
+Pomiar (nośna i SSB z HackRF przez kabel, tłumik 30 dB):
+
+| | zero-IF | low-IF 100 kHz |
+|---|---|---|
+| DC na środku | 38 dB nad szumem | 10 dB |
+| spury ±1.1 kHz | 20–23 dB | brak |
+| audio poza pasmem mowy (3–8 kHz) | −41.5 dB | −68.6 dB |
+| rozkład energii mowy względem oryginału | do ok. 2 dB | do ok. 2 dB |
+
+`esp_sdr.py` domyślnie pracuje w low-IF (`--zif` przełącza na zero-IF,
+`--lif` ustawia IF w kHz). W oknie jest pole „low-IF, IF [kHz]”; wartość
+ujemna stawia LO powyżej sygnału. Przestrojenie, przy którym IF zostaje w
+zakresie 30–300 kHz, idzie przez samo NCO. Na waterfallu widać czasem
+poziome pasy przez całą szerokość. To najpewniej pakiety Wi‑Fi: krótkie
+okno przepuszcza więcej z kanału ±10 MHz i zawija to w pasmo.
+
+## 2300 MHz i zakres PLL
+
+- **Zakres PLL:** synchronizuje się w 2300–2700 MHz, na granicy przy
+  2200 / 2800. Polecenie spoza zakresu dociska VCO do krańca, a LO nie
+  zatrzymuje się.
+- **Odbiór na 2300 MHz:** działa w obu trybach. Wąski prążek ok. 3.8 kHz
+  pod 2300.000 MHz to najpewniej 230. harmoniczna zegara 10 MHz HackRF
+  podłączonego kablem.
+- **Nadawanie na 2300 MHz:** działa (`ON`, potem eksperymentalnie
+  `PLL 2300 0`). Moc praktycznie ta sama co na 2412, w granicach ±3 dB.
+  Tryby SSB/STREAM tak daleko jeszcze nie sięgają, bo nośna to kanał +
+  pole K (±39 MHz).
+
+## Eksperymenty z „direct sampling” (bez wyniku)
+
+Próba zrobienia mieszacza przezroczystego dla HF (1–5 MHz, ok. −20…−30 dBm
+na wejściu):
+- **Zatrzymanie LO:** I2C 98/3 bit 5 (VCO), RFPLL_CTRL hold/latch i PLL
+  poza zakresem.
+- **Włączniki PBUS(2,1).**
+
+HF nie przechodzi w żadnej konfiguracji (tłumienie ponad 70 dB). Stan po
+zatrzymaniu LO jest za każdym razem ten sam. Komendy diagnostyczne zostały w
+szkicu: `I2C blk host reg [val]` (blok 103 = zegar CPU, zablokowany),
+`PLL mhz off`, `RD`/`WR` (rejestry 0x6000xxxx), `PB ENTER|EXIT|DUMP|sel bank
+val`, `IQT n wariant` (czasy estymatora), `IQ 0 n tryb` (pomiar bez
+strojenia). Przy okazji wyszło, że przy n = 1..15 estymator daje prawie
+surowe próbki ADC (563–462 kS/s), a koherentne DFT z chwilami z ccount
+działa w ok. ±2 MHz wokół LO.
+
 ## Odbiornik SSB z oknem (`esp_sdr.py`)
 
 `CW_CARRIER_TEST/audio/esp_sdr.py`: widmo, waterfall, demodulator USB/LSB
@@ -183,8 +282,7 @@ python3 esp_sdr.py --wav t.wav --seconds 10   # bez okna, do testów
 - **Offset DC** odbiornika (kreska na środku): odejmować średnią
   (`--dc`) albo filtrować.
 - **Niedopasowanie I/Q:** lustro na ok. −31 dBc. Bez korekcji na PC.
-- **Wzmocnienie odbiornika** nie jest ustawiane; zostaje takie, jakie
-  zostawił stos Wi‑Fi.
+- **Wzmocnienie odbiornika:** AGC albo ręcznie (rozdział wyżej).
 - **Jedno naraz:** odbiór i nadawanie nie działają jednocześnie.
 - **Przepustowość:** ograniczona przez CH340 (ok. 2 Mbaud), a nie przez
   sam estymator.
@@ -192,14 +290,18 @@ python3 esp_sdr.py --wav t.wav --seconds 10   # bez okna, do testów
 ## Otwarte pytania
 
 - Co wybiera bit 18 (tryb)?
-- Czy da się ustawić wzmocnienie odbiornika ręcznie? Notatki kaboom748
-  wskazują `0x60000590` jako sterowanie wzmocnieniem.
 - Korekcja DC i I/Q na PC, demodulatory (NFM, SSB) w `rx_iq.py`.
-- Nadawanie z offsetem PLL (`set_rf_freq_offset` także przy TX): nośna
-  QO-100 bez przesuwania polem K o −12 MHz od kanału 1. Nie testowane.
+- Nadawanie z offsetem PLL w trybach SSB/STREAM. Sama nośna na 2300 MHz
+  działa, a QO-100 dałoby się nadawać bez przesuwania polem K o −12 MHz od
+  kanału 1.
+- Pomiar aliasingu w low-IF (pakiety Wi‑Fi) i ewentualnie dłuższe okno.
+- Korekcja lustra I/Q (−31 dBc), ważniejsza przy low-IF.
 
 ## Źródła
 
+- **teatime-os** (github.com/23watejona/teatime-os, `wifi_regs.h`): nazwy
+  rejestrów RF ESP8266, bloki I2C 98 = RFPLL, 99 = RFPLL_SDM,
+  100 = RX_GAIN.
 - **kaboom748/esp8266_WLAN_PHY:** notatki o IQ_EST, „E4”, `RX_IQ_0..3`
   i adresach funkcji ROM (dziennik CCA, referencje RX OOK i FSK).
 - **Moja analiza:** zrzut ROM z płytki, deasemblacja `rom_dc_iq_est`,

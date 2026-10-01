@@ -134,10 +134,23 @@ estimator of the Wi-Fi receiver (normally used for calibration) averages
 35.7 kS/s (k=10), streamed over USB at 2 Mbaud (`IQSTREAM f k mode`). The
 LO can be set anywhere from 2300 to 2600 MHz in 1/1024 MHz steps: nearest
 Wi-Fi channel plus a fractional-N PLL offset (`set_rf_freq_offset` from
-`libphy.a`). `esp_sdr.py` shows the spectrum and waterfall and demodulates
-USB/LSB with sound; click the spectrum to tune. It needs PyQt5, pyqtgraph
-and sounddevice in addition to the requirements above. Details and
-measurements (in Polish): `ODBIORNIK_IQ.md`.
+`libphy.a`); the PLL locks from about 2300 to 2700 MHz. `esp_sdr.py` shows
+the spectrum and waterfall and demodulates USB/LSB with sound; click the
+spectrum to tune. It needs PyQt5, pyqtgraph and sounddevice in addition to
+the requirements above. Details and measurements (in Polish):
+`ODBIORNIK_IQ.md`.
+
+- **Low-IF (default):** `IQLIF f [if [D]]` puts the PLL LO 100 kHz to the
+  side. The estimator runs with a 0.8 µs window at about 500 kS/s, and the
+  ESP removes DC, mixes with a complex NCO (phase from the CPU cycle
+  counter) and decimates with a 2nd-order CIC. The centre of the band is
+  free of the zero-IF DC line and 1/f hump: about 28 dB less at the centre,
+  and out-of-band audio junk drops from −41 to −69 dB. Small retunes move
+  only the NCO, without a gap. `--zif` switches back to `IQSTREAM`.
+- **Receiver gain:** the hardware AGC, or manual RF (LNA/mixer, about
+  21 dB) and VGA sliders. The gain fields are forced over the internal PBUS
+  in its debug mode and changed live by a byte in the stream
+  (`GAIN AGC | GAIN rf vga` over serial).
 
 ```sh
 cd CW_CARRIER_TEST/audio

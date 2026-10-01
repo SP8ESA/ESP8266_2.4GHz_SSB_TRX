@@ -13,6 +13,12 @@ wejdzie na kreske DC), LO przestawia sie samo - przestrojenie to ok. 0.1 s
 przerwy. Klik / przeciagniecie w widmie albo waterfallu stroi, kolko myszy
 na polu czestotliwosci zmienia ja o krok.
 
+Domyslnie low-IF (IQLIF): LO z PLL o --lif kHz (100) obok, mnozenie przez nosna
+zespolona i decymacja w ESP, wiec srodek pasma jest czysty (bez kreski DC i
+garbu 1/f); male przestrojenia ida przez samo NCO, bez przerwy. --zif = stary
+tryb IQSTREAM. Wzmocnienie odbiornika: AGC albo recznie suwaki RF (LNA, ~21 dB)
+i VGA (~1 dB), zmiana na zywo bajtem w strumieniu.
+
 Zgubione przez CH340 paczki (16 probek) sa wypelniane biezacym DC, wiec po
 filtrze DC nie trzaskaja. Dzwiek: liniowa interpolacja do 48 kHz z lekka
 korekta proporcji wg zapelnienia bufora (zegary ESP i karty dzwiekowej sie
@@ -48,9 +54,13 @@ class EspReader(threading.Thread):
     """Watek z portem: IQSTREAM, skladanie paczek na osi czasu, przestrajanie.
     Wynik w self.out: (generacja, LO Hz, fs, probki complex64)."""
 
-    def __init__(self, port, k=10, mode=0):
+    def __init__(self, port, k=10, mode=0, lif=100000, dec=15):
         super().__init__(daemon=True)
         self.port, self.k, self.mode = port, k, mode
+        self.lif, self.dec = lif, dec   # low-IF: IF w Hz (None = zero-IF), decymacja w ESP
+        self.lo_hw = None               # LO PLL (low-IF), srodek = lo_hw + nco
+        self._lif_on = None
+        self._khz = None
         self.out = queue.Queue(maxsize=200)
         self.req = queue.Queue()
         self.gen = 0
@@ -59,9 +69,19 @@ class EspReader(threading.Thread):
         self.lost = self.packets = 0
         self.err = None
         self.running = True
+        self.gain = None          # None = AGC odbiornika, albo (rf 0..6, vga 0..7)
+        self.gain_dirty = False
 
     def tune(self, khz):
         self.req.put(int(round(khz)))
+
+    def set_gain(self, gain):
+        """Wzmocnienie ESP w trakcie strumienia: None = AGC, (rf, vga) = recznie."""
+        self.gain = gain
+        self.gain_dirty = True
+
+    def _gain_byte(self):
+        return b"\xff" if self.gain is None else bytes([0x80 | self.gain[0] << 3 | self.gain[1]])
 
     def stop(self):
         self.running = False
@@ -76,26 +96,46 @@ class EspReader(threading.Thread):
         return s
 
     def _start(self, s, khz):
+        """Start strumienia; zwraca srodek pasma w Hz (zero-IF: LO, low-IF: LO + NCO)."""
         s.baudrate = 115200
         s.reset_input_buffer()
-        s.write(f"IQSTREAM {khz // 1000}.{khz % 1000:03d} {self.k} {self.mode}\r\n".encode())
+        f = f"{khz // 1000}.{khz % 1000:03d}"
+        self._lif_on, self._khz = self.lif, khz
+        if self.lif:
+            s.write(f"IQLIF {f} {self.lif} {self.dec}\r\n".encode())
+            ok = b"OK IQLIF"
+        else:
+            s.write(f"IQSTREAM {f} {self.k} {self.mode}\r\n".encode())
+            ok = b"OK IQSTREAM"
         buf, t0 = b"", time.time()
-        while b"OK IQSTREAM" not in buf and time.time() - t0 < 3:
+        while ok not in buf and time.time() - t0 < 3:
             buf += s.read(4096)
         m = re.search(rb"RXF (\d+)", buf)
-        if b"OK IQSTREAM" not in buf or not m:
+        if ok not in buf or not m:
             raise RuntimeError(f"ESP: {buf[-200:]!r}")
         time.sleep(0.01)
         s.baudrate = BAUD
         s.reset_input_buffer()
-        return int(m.group(1))
+        self.lo_hw = int(m.group(1))
+        if self.lif:
+            self.nco = float(re.search(rb"NCO (-?\d+)", buf).group(1))
+            return self.lo_hw + self.nco
+        return self.lo_hw
+
+    def _set_nco(self, s, nco):
+        """low-IF: nowa czestotliwosc NCO w ESP bez przerwy w strumieniu."""
+        k = int(round(nco * 2 ** 32 / CPU_HZ)) & 0xFFFFFFFF
+        s.write(b"\xfe" + k.to_bytes(4, "little"))
+        self.nco = k * CPU_HZ / 2 ** 32 if k < 2 ** 31 else (k - 2 ** 32) * CPU_HZ / 2 ** 32
+        self.gen += 1
+        self.lo = self.lo_hw + self.nco
 
     def _stop(self, s):
         s.write(b"x")
         time.sleep(0.02)
         s.baudrate = 115200
         buf, t0 = b"", time.time()
-        while b"IQSTREAM END" not in buf and time.time() - t0 < 2:
+        while b" END" not in buf and time.time() - t0 < 2:
             buf += s.read(4096)
 
     def run(self):
@@ -120,16 +160,32 @@ class EspReader(threading.Thread):
     def _pump(self, s):
         """Czyta strumien do zadania przestrojenia; zwraca nowe kHz albo None."""
         buf = bytearray()
-        per = (2 ** self.k * 25e-9 + 1.8e-6) * CPU_HZ * SPP   # cykli na paczke (start)
+        if self.lif:            # cykli na paczke (start), potem srednia z naglowkow
+            per = self.dec * 1.99e-6 * CPU_HZ * SPP
+        else:
+            per = (2 ** self.k * 25e-9 + 1.8e-6) * CPU_HZ * SPP
         prev = None
         dc = 0j
         pend = []
         t_flush = time.time()
+        self.gain_dirty = True        # po (re)starcie strumienia wyslij biezace
         while self.running:
+            if self.gain_dirty:
+                self.gain_dirty = False
+                s.write(self._gain_byte())
+            if self.lif != self._lif_on:          # zmiana trybu: restart strumienia
+                return self._khz
             try:
                 new = self.req.get_nowait()
                 while not self.req.empty():
                     new = self.req.get_nowait()
+                nco = new * 1000 - self.lo_hw
+                if self.lif and 30e3 <= abs(nco) <= 300e3:
+                    self._set_nco(s, nco)          # w zasiegu NCO: bez przerwy
+                    self._khz = new
+                    prev = None
+                    pend = []
+                    continue
                 return new
             except queue.Empty:
                 pass
@@ -304,11 +360,11 @@ def spectrum_rows(x, fs):
 class Engine(threading.Thread):
     """Laczy ESP z demodulatorem, dzwiekiem i widmem; strojenie i auto-LO."""
 
-    def __init__(self, port, f_hz, lsb, ppm=0.0):
+    def __init__(self, port, f_hz, lsb, ppm=0.0, lif=100000):
         super().__init__(daemon=True)
         self.ppm = ppm          # kwarc ESP: prawdziwe LO = nominalne * (1 + ppm)
         self.esp_lo = None      # LO nominalne (z RXF)
-        self.esp = EspReader(port)
+        self.esp = EspReader(port, lif=lif)
         self.demod = Demod()
         self.demod.lsb = lsb
         self.fifo = AudioFifo()
@@ -326,8 +382,16 @@ class Engine(threading.Thread):
     def lo_for(self, f_hz):
         """LO 5 kHz obok sygnalu, po stronie bez wstegi (USB: LO nizej), zeby
         kreska DC i spur ESP (-0.75 kHz) nie wpadly w pasmo audio."""
+        if self.esp.lif:        # low-IF: srodek czysty, stroimy prosto na odbior
+            return int(round(f_hz / (1 + self.ppm * 1e-6) / 1000))
         side = 1 if self.demod.lsb else -1
         return int(round((f_hz + side * 5000) / (1 + self.ppm * 1e-6) / 1000))
+
+    def set_lif(self, if_hz):
+        """None = zero-IF (IQSTREAM), liczba = low-IF z tym IF w Hz (IQLIF)."""
+        with self.lock:
+            self.esp.lif = if_hz
+            self.lo_req = None
 
     def set_ppm(self, ppm):
         with self.lock:
@@ -353,7 +417,9 @@ class Engine(threading.Thread):
             ok = False
             if self.lo:
                 a, b = self.band_edges(f_hz - self.lo)
-                ok = (a > 400 or b < -400) and max(abs(a), abs(b)) < self.fs / 2 - 1500
+                ok = max(abs(a), abs(b)) < self.fs / 2 - 1500
+                if not self.esp.lif:
+                    ok = ok and (a > 400 or b < -400)
             if ok:
                 self.demod.set(off=f_hz - self.lo)
             else:
@@ -500,6 +566,63 @@ def run_gui(eng, args):
     smeter.setMaximumWidth(160)
     bar.addWidget(smeter)
 
+    # -- wzmocnienie odbiornika ESP: AGC albo recznie RF (LNA) i VGA
+    bar2 = QtWidgets.QHBoxLayout()
+    lay.addLayout(bar2)
+    agc = QtWidgets.QCheckBox("AGC odbiornika (ESP)")
+    agc.setChecked(True)
+    bar2.addWidget(agc)
+    sliders = {}
+    for key, label, hi, init in (("rf", "RF / LNA", 6, 2), ("vga", "VGA", 7, 2)):
+        bar2.addWidget(QtWidgets.QLabel(label + ":"))
+        sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        sl.setRange(0, hi)
+        sl.setValue(init)
+        sl.setPageStep(1)
+        sl.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        sl.setMaximumWidth(200)
+        val = QtWidgets.QLabel(str(init))
+        val.setMinimumWidth(16)
+        sl.valueChanged.connect(lambda v, lb=val: lb.setText(str(v)))
+        bar2.addWidget(sl)
+        bar2.addWidget(val)
+        sliders[key] = sl
+    bar2.addWidget(QtWidgets.QLabel("(RF: ~21 dB w 6 krokach, VGA: ~1 dB)"))
+    bar2.addSpacing(20)
+    lifb = QtWidgets.QCheckBox("low-IF, IF [kHz]:")
+    lifb.setChecked(bool(eng.esp.lif))
+    bar2.addWidget(lifb)
+    lifv = QtWidgets.QSpinBox()
+    lifv.setRange(-300, 300)
+    lifv.setValue(int((eng.esp.lif or 100000) / 1000))
+    lifv.setKeyboardTracking(False)
+    bar2.addWidget(lifv)
+    bar2.addStretch(1)
+
+    def on_lif(*_):
+        v = lifv.value()
+        if abs(v) < 20:
+            v = 20 if v >= 0 else -20
+            lifv.setValue(v)
+            return
+        lifv.setEnabled(lifb.isChecked())
+        eng.set_lif(v * 1000 if lifb.isChecked() else None)
+
+    lifb.toggled.connect(on_lif)
+    lifv.valueChanged.connect(on_lif)
+    lifv.setEnabled(lifb.isChecked())
+
+    def on_gain(*_):
+        manual = not agc.isChecked()
+        for sl in sliders.values():
+            sl.setEnabled(manual)
+        eng.esp.set_gain((sliders["rf"].value(), sliders["vga"].value()) if manual else None)
+
+    agc.toggled.connect(on_gain)
+    for sl in sliders.values():
+        sl.valueChanged.connect(on_gain)
+    on_gain()
+
     # -- widmo i waterfall
     gl = pg.GraphicsLayoutWidget()
     lay.addWidget(gl, 1)
@@ -642,7 +765,9 @@ def run_gui(eng, args):
         elif st["lo"] is not None:
             lost = e.lost / max(e.packets, 1) * 100
             status.setText(
-                f"LO {st['lo'] / 1e6:.6f} MHz (ESP {eng.esp_lo}) | fs {st['fs']:.0f} S/s (pasmo ±{st['fs'] / 2e3:.1f} kHz)"
+                (f"środek {st['lo'] / 1e6:.6f} MHz (PLL {e.lo_hw / 1e6:.6f}, NCO {e.nco / 1e3:+.1f} kHz)"
+                 if e.lif and e.lo_hw else f"LO {st['lo'] / 1e6:.6f} MHz (ESP {eng.esp_lo})") +
+                f" | fs {st['fs']:.0f} S/s (pasmo ±{st['fs'] / 2e3:.1f} kHz)"
                 f" | odbiór {eng.f_rx / 1e6:.6f} MHz {'LSB' if eng.demod.lsb else 'USB'}"
                 f" | zgubione paczki {lost:.1f}% | bufor audio {eng.fifo.fill() / AUDIO_FS * 1000:.0f} ms")
 
@@ -691,11 +816,13 @@ def main():
     ap.add_argument("--lsb", action="store_true")
     ap.add_argument("--ppm", type=float, default=-0.5,
                     help="kwarc ESP wzgledem wzorca (HackRF: ok. -0.5 ppm)")
+    ap.add_argument("--zif", action="store_true", help="zero-IF (IQSTREAM) zamiast low-IF")
+    ap.add_argument("--lif", type=int, default=100, help="IF w kHz dla low-IF (+-20..300)")
     ap.add_argument("--port", default="/dev/ttyUSB0")
     ap.add_argument("--wav", help="bez okna: zapisz demodulowane audio")
     ap.add_argument("--seconds", type=float, default=10)
     a = ap.parse_args()
-    eng = Engine(a.port, int(round(a.f * 1e6)), a.lsb, a.ppm)
+    eng = Engine(a.port, int(round(a.f * 1e6)), a.lsb, a.ppm, None if a.zif else a.lif * 1000)
     if a.wav:
         run_wav(eng, a.wav, a.seconds)
     else:

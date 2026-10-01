@@ -825,6 +825,31 @@ static bool rxTune(uint32_t fkhz) {
   return true;
 }
 
+// Wzmocnienie odbiornika: pola PBUS w trybie debug (rom_pbus_debugmode, RX
+// zostaje wlaczony; NIE rom_pbus_enter_debugmode - ten wylacza RX), wtedy AGC
+// nie moze ich zmienic. PBUS(3,1) = stopien RF (LNA/mieszacz), 7 bitow w
+// odwrotnej kolejnosci niz "termometr" rf: rf 0..6 = 0x00,0x40,0x60,...,0x7F,
+// poziom szumu -14 -> +6 dB (~21 dB), S/N slabego SSB 29..32 dB na kazdym
+// kroku. PBUS(3,2) bity 5..3 = VGA pasma podstawowego, 8 krokow, ~1 dB. Celowo bez rom_pbus_set_rxgain (przepisuje tez PBUS(2,1) -
+// wlaczniki toru RX, gasi LNA) i bez rom_pbus_exit_debugmode (robi "TX off" i
+// zostawia PBUS(2,1) = 0x184 zamiast 0x1FE). AGC sam: bez sygnalu rf 2 vga 2,
+// przy silnym rf 0 vga 5. rf < 0 = powrot do AGC (rom_pbus_workmode).
+static void rxGain(int rf, int bb) {
+  using V0 = void(*)(void);
+  using RdFn = uint32_t(*)(uint32_t, uint32_t);
+  using WrFn = void(*)(uint32_t, uint32_t, uint32_t);
+  const RdFn pbus_rd = reinterpret_cast<RdFn>(0x400074D8u);
+  const WrFn pbus_force = reinterpret_cast<WrFn>(0x4000747Cu);
+  if (rf < 0) {
+    if (rd32(PBUS_CMD) & 1u) reinterpret_cast<V0>(0x40007648u)();  // rom_pbus_workmode
+    return;
+  }
+  static const uint8_t RF_31[7] = {0x00, 0x40, 0x60, 0x70, 0x78, 0x7C, 0x7F};
+  reinterpret_cast<V0>(0x4000737Cu)();  // rom_pbus_debugmode (pomija, gdy juz jest)
+  pbus_force(3, 1, RF_31[rf < 6 ? rf : 6]);
+  pbus_force(3, 2, (pbus_rd(3, 2) & 0x1C7u) | (uint32_t)(bb & 7) << 3);
+}
+
 // "ch" 1..14 (srodek kanalu) albo czestotliwosc w MHz, np. 2414.5
 static bool parseRxFreq(const String& s, uint32_t& fkhz) {
   long ch = 0;
@@ -835,10 +860,20 @@ static bool parseRxFreq(const String& s, uint32_t& fkhz) {
   return parseKHz(s, fkhz);
 }
 
+// Wewnetrzna magistrala I2C bloków analogowych (ROM). Bloki wg wywolan w
+// libphy.a: 97 tor RX, 98 PLL RF (reg 3 = wlaczniki: sen 0x01, praca 0xF1),
+// 101 (sen 0x06, praca 0xC6), 103 BBPLL (zegar CPU - nie ruszac), 108 SAR,
+// 119 styk analog/cyfra. "I2C blk host reg [val]".
+using I2cRdFn = uint8_t(*)(uint8_t, uint8_t, uint8_t);
+using I2cWrFn = void(*)(uint8_t, uint8_t, uint8_t, uint8_t);
+static I2cRdFn i2c_rd = reinterpret_cast<I2cRdFn>(0x40007268u);
+static I2cWrFn i2c_wr = reinterpret_cast<I2cWrFn>(0x400072d8u);
+
+// f = 0: bez strojenia (zostaja ustawienia z I2C)
 static void iqCapture(uint32_t fkhz, uint32_t n, uint32_t mode) {
   txStop();
   modeStop();
-  if (!rxTune(fkhz)) {
+  if (fkhz && !rxTune(fkhz)) {
     Serial.println(F("ERR TUNE"));
     return;
   }
@@ -859,12 +894,57 @@ static void iqCapture(uint32_t fkhz, uint32_t n, uint32_t mode) {
   Serial.println();
 }
 
+// Eksperyment: czasy estymatora. "IQT n wariant": 1024 pomiary jak "IQ 0",
+// ale w polu P zapisuje ccount gotowosci. Wariant 0 = ROM enable/disable,
+// 1 = ta sama sekwencja wpisana bezposrednio, 2 = bit 0 wlaczony raz, potem
+// tylko start (bit 1) / odczyt / kasowanie startu.
+static constexpr uint32_t IQ_CTRL = 0x6000057Cu;
+static constexpr uint32_t IQ_MASK = 0xFFFA0001u;
+static void IRAM_ATTR __attribute__((noinline)) iqTest(uint32_t n, uint32_t variant) {
+  const uint32_t ps = xt_rsil(15);
+  if (variant == 2) wr32(IQ_CTRL, rd32(IQ_CTRL) | 1u);
+  for (uint16_t i = 0; i < IQ_N; ++i) {
+    const uint32_t t0 = ESP.getCycleCount();
+    if (variant == 0) {
+      iq_est_enable(0, n);
+    } else if (variant == 1) {
+      wr32(IQ_CTRL, rd32(IQ_CTRL) | 1u);
+      wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | n << 2 | 2u);
+      while (!(rd32(IQ_CTRL) & 0x80000000u)) {}
+    } else {
+      wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | n << 2 | 2u);
+      while (!(rd32(IQ_CTRL) & 0x80000000u)) {}
+    }
+    const uint32_t t1 = ESP.getCycleCount();
+    stBuf[4 * i] = t0;
+    stBuf[4 * i + 1] = rd32(IQ_SUM_I);
+    stBuf[4 * i + 2] = rd32(IQ_SUM_Q);
+    stBuf[4 * i + 3] = t1;
+    if (variant == 0) {
+      iq_est_disable();
+    } else if (variant == 1) {
+      wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | 0x1000u);
+      wr32(IQ_CTRL, rd32(IQ_CTRL) & ~1u);
+    } else {
+      wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | n << 2);
+    }
+  }
+  if (variant == 2) wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK & ~1u) | 0x1000u);
+  xt_wsr_ps(ps);
+  Serial.printf("IQDATA %u\n", IQ_N);
+  Serial.write(reinterpret_cast<const uint8_t*>(stBuf), sizeof(stBuf));
+  Serial.flush();
+  Serial.println();
+}
+
 // "IQSTREAM f k tryb": ciagly odbior, okno n+1 = 2^k probek ADC (40 MS/s),
 // srednia I/Q = suma >> k jako i16. UART na ST_BAUD; co 16 probek naglowek
 // A5 5A + ccount 24 bity LE (z niego PC liczy fs i uklada paczki na osi
 // czasu), potem 16 x (I, Q) i16 LE. Male paczki: zgubiony bajt (CH340) psuje
 // tylko 16 probek. Gdy FIFO nie ma miejsca, czeka (licznik przestojow).
-// Dowolny bajt od PC konczy strumien (powrot na 115200 + podsumowanie).
+// Bajt od PC: 0xFF = AGC, 0x80 | rf << 3 | vga = wzmocnienie reczne (rf 0..6,
+// vga 0..7, bez przerwy w strumieniu), inny konczy strumien (powrot na 115200
+// + podsumowanie).
 static void iqStream(uint32_t fkhz, uint32_t k, uint32_t mode) {
   txStop();
   modeStop();
@@ -905,7 +985,12 @@ static void iqStream(uint32_t fkhz, uint32_t k, uint32_t mode) {
     USF(0) = vi; USF(0) = vi >> 8; USF(0) = vq; USF(0) = vq >> 8;
     ++samples;
     if ((i & 1023) == 0) ESP.wdtFeed();
-    if ((USS(0) >> USRXC) & 0xFF) break;  // PC konczy
+    if ((USS(0) >> USRXC) & 0xFF) {
+      const uint8_t c = USF(0);
+      if (!(c & 0x80)) break;              // PC konczy
+      if (c == 0xFF) rxGain(-1, 0);
+      else rxGain((c >> 3) & 7, c & 7);
+    }
   }
   xt_wsr_ps(ps);
   delay(50);
@@ -913,6 +998,144 @@ static void iqStream(uint32_t fkhz, uint32_t k, uint32_t mode) {
   Serial.updateBaudRate(115200);
   while (Serial.available()) Serial.read();
   Serial.printf("IQSTREAM END probek=%lu przestojow_fifo=%lu\r\n",
+                (unsigned long)samples, (unsigned long)stalls);
+}
+
+// ---------------------------------------------------------------- RX low-IF
+// "IQLIF f if D": odbior z LO przesunietym o if Hz (LO = f - if, domyslnie
+// 100 kHz), zeby kreska DC, garb szumu przy LO i spur -0.75 kHz lezaly poza
+// pasmem. Estymator z krotkim oknem 32 probek ADC (0.8 us, sterowany
+// bezposrednio: start, w czasie pomiaru (~1.2 us) obrobka poprzedniej probki,
+// odczyt) daje ~550 kS/s. Na CPU: odjecie DC (IIR), mnozenie przez
+// exp(-j*2*pi*f_nco*t) z faza z ccount (CPU i ADC na wspolnym kwarcu, wiec
+// nierowne odstepy probek nie psuja fazy), CIC 2. rzedu z decymacja /D
+// (domyslnie 15 -> ~36 kS/s). Wyjscie jak IQSTREAM: co 16 probek A5 5A +
+// ccount 24 bity, 16 x (I, Q) i16 LE. Bajty od PC: 0xFF = AGC, 0x80 | rf << 3
+// | vga = wzmocnienie, 0xFE + 4 bajty (int32 LE) = nowe K NCO (f_nco = K *
+// 160 MHz / 2^32) bez przerwy w strumieniu, inny bajt konczy.
+static int16_t lifSin[1024];
+
+static void lifTable() {
+  if (lifSin[256]) return;
+  for (int i = 0; i < 1024; ++i) lifSin[i] = (int16_t)lroundf(16383.0f * sinf(i * 6.2831853f / 1024));
+}
+
+static int32_t lifK(double fHz) {
+  return (int32_t)llround(fHz * 4294967296.0 / ((double)ESP.getCpuFreqMHz() * 1e6));
+}
+
+static void IRAM_ATTR __attribute__((noinline)) lifLoop(int32_t k0, uint32_t dec, uint32_t* samples, uint32_t* stalls) {
+  const uint32_t nsum = 31;
+  const uint32_t shift = 5 + (uint32_t)ceilf(2 * log2f((float)dec));
+  uint32_t k = (uint32_t)k0;
+  int32_t dci = 0, dcq = 0;                 // DC w Q8
+  uint32_t i1 = 0, i2 = 0, q1 = 0, q2 = 0;  // integratory CIC (modulo 2^32)
+  uint32_t pi2 = 0, pq2 = 0, pci = 0, pcq = 0;
+  int32_t xi = 0, xq = 0;
+  uint32_t tprev = 0, cnt = 0, nout = 0;
+  bool have = false;
+  wr32(IQ_CTRL, rd32(IQ_CTRL) | 1u);
+  for (uint32_t loop = 0;; ++loop) {
+    const uint32_t t0 = ESP.getCycleCount();
+    wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | nsum << 2 | 2u);
+    if (have) {                             // poprzednia probka w czasie pomiaru
+      dci += ((xi << 8) - dci) >> 11;
+      dcq += ((xq << 8) - dcq) >> 11;
+      const int32_t ri = xi - (dci >> 8), rq = xq - (dcq >> 8);
+      const uint32_t ph = (tprev * k) >> 22;
+      const int32_t sn = lifSin[ph], cs = lifSin[(ph + 256) & 1023];
+      i1 += (uint32_t)((ri * cs + rq * sn) >> 4);
+      q1 += (uint32_t)((rq * cs - ri * sn) >> 4);
+      i2 += i1;
+      q2 += q1;
+      if (++cnt == dec) {
+        cnt = 0;
+        const uint32_t ci = i2 - pi2, cq = q2 - pq2;
+        pi2 = i2;
+        pq2 = q2;
+        int32_t oi = (int32_t)(ci - pci) >> shift, oq = (int32_t)(cq - pcq) >> shift;
+        pci = ci;
+        pcq = cq;
+        oi = oi > 32767 ? 32767 : oi < -32768 ? -32768 : oi;
+        oq = oq > 32767 ? 32767 : oq < -32768 ? -32768 : oq;
+        const bool head = (nout & 15) == 0;
+        const uint32_t need = head ? 9 : 4;
+        if (128 - ((USS(0) >> USTXC) & 0xFF) < need) {
+          ++*stalls;
+          while (128 - ((USS(0) >> USTXC) & 0xFF) < need) {}
+        }
+        if (head) {
+          const uint32_t t = ESP.getCycleCount();
+          USF(0) = 0xA5; USF(0) = 0x5A;
+          USF(0) = t; USF(0) = t >> 8; USF(0) = t >> 16;
+        }
+        USF(0) = oi; USF(0) = oi >> 8; USF(0) = oq; USF(0) = oq >> 8;
+        ++nout;
+        ++*samples;
+      }
+    }
+    while (!(rd32(IQ_CTRL) & 0x80000000u)) {}
+    xi = (int32_t)rd32(IQ_SUM_I) >> 8;      // srednia z 32 probek ADC x8
+    xq = (int32_t)rd32(IQ_SUM_Q) >> 8;
+    wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK) | nsum << 2);
+    tprev = t0;
+    have = true;
+    if ((loop & 4095) == 0) ESP.wdtFeed();
+    if ((USS(0) >> USRXC) & 0xFF) {
+      const uint8_t c = USF(0);
+      if (!(c & 0x80)) break;
+      if (c == 0xFF) {
+        rxGain(-1, 0);
+      } else if (c == 0xFE) {
+        uint32_t nk = 0;
+        for (int b = 0; b < 4; ++b) {
+          const uint32_t tw = ESP.getCycleCount();
+          while (!((USS(0) >> USRXC) & 0xFF)) {
+            if (ESP.getCycleCount() - tw > 160000) break;   // 1 ms
+          }
+          nk |= (uint32_t)(uint8_t)USF(0) << (8 * b);
+        }
+        k = nk;
+      } else {
+        rxGain((c >> 3) & 7, c & 7);
+      }
+    }
+  }
+  wr32(IQ_CTRL, (rd32(IQ_CTRL) & IQ_MASK & ~1u) | 0x1000u);
+}
+
+static void iqLif(uint32_t fkhz, int32_t ifHz, uint32_t dec) {
+  txStop();
+  modeStop();
+  const int32_t lokhz = (int32_t)fkhz - ifHz / 1000;
+  if (!rxTune((uint32_t)lokhz)) {
+    Serial.println(F("ERR TUNE"));
+    return;
+  }
+  lifTable();
+  const uint8_t ch = (uint8_t)constrain(((int32_t)lokhz - 2407000 + 2500) / 5000, 1, 13);
+  // LO faktyczne jak w rxTune: kanal + off/1024 MHz
+  const int32_t d = lokhz - chMHz(ch) * 1000;
+  const int32_t o = (d * 1024 + (d < 0 ? -500 : 500)) / 1000;
+  const double loHz = chMHz(ch) * 1e6 + o * 1e6 / 1024;
+  const double nco = fkhz * 1e3 - loHz;
+  const int32_t k = lifK(nco);
+  Serial.printf("OK IQLIF %lu NCO %ld K %ld\r\n", (unsigned long)ST_BAUD, (long)lround(nco), (long)k);
+  Serial.flush();
+  delay(20);
+  Serial.updateBaudRate(ST_BAUD);
+  USC0(0) = (USC0(0) & ~(3u << UCSBN)) | (3u << UCSBN);
+  delay(20);
+  while (Serial.available()) Serial.read();
+  uint32_t samples = 0, stalls = 0;
+  const uint32_t ps = xt_rsil(15);
+  lifLoop(k, dec, &samples, &stalls);
+  xt_wsr_ps(ps);
+  delay(50);
+  USC0(0) = (USC0(0) & ~(3u << UCSBN)) | (1u << UCSBN);
+  Serial.updateBaudRate(115200);
+  while (Serial.available()) Serial.read();
+  Serial.printf("IQLIF END probek=%lu przestojow_fifo=%lu\r\n",
                 (unsigned long)samples, (unsigned long)stalls);
 }
 
@@ -1037,6 +1260,8 @@ static void printHelp() {
   Serial.println(F("CAL AM | CAL DLY | CAL OFF (pomiar toru pod SSB)"));
   Serial.println(F("STREAM f (MHz) - SSB z probek z PC przez USB (audio/stream_ssb.py)"));
   Serial.println(F("IQ f n tryb | IQSTREAM f k tryb - odbior IQ, f = kanal albo MHz (audio/rx_iq.py)"));
+  Serial.println(F("GAIN AGC | GAIN rf 0..6 vga 0..7 - wzmocnienie odbiornika"));
+  Serial.println(F("IQLIF f [if_Hz [D]] - odbior low-IF (LO = f - if, NCO w ESP)"));
 }
 
 static bool parseArg(const String& s, long lo, long hi, long& out) {
@@ -1188,14 +1413,139 @@ static void handle(String cmd) {
     gDepth = (uint8_t)v;
     if (mode == MODE_AM) audioStart(MODE_AM);
     printStatus();
+  } else if (name == "I2C") {
+    long v[4] = {-1, -1, -1, -1};
+    int cnt = 0, pos = 0;
+    while (cnt < 4 && pos < (int)arg.length()) {
+      int e = arg.indexOf(' ', pos);
+      if (e < 0) e = arg.length();
+      if (!parseArg(arg.substring(pos, e), 0, 255, v[cnt])) break;
+      ++cnt;
+      pos = e + 1;
+    }
+    if (cnt < 3 || (int)arg.length() >= pos + 1) {
+      Serial.println(F("ERR I2C blk host reg [val]"));
+      return;
+    }
+    if (v[0] == 103) {
+      Serial.println(F("ERR I2C 103 = BBPLL (zegar CPU)"));
+      return;
+    }
+    const uint8_t old = i2c_rd(v[0], v[1], v[2]);
+    if (cnt == 4) i2c_wr(v[0], v[1], v[2], v[3]);
+    Serial.printf("I2C %ld %ld %ld = 0x%02X -> 0x%02X\r\n", v[0], v[1], v[2], old,
+                  i2c_rd(v[0], v[1], v[2]));
+  } else if (name == "PLL") {
+    // eksperyment: PLL RF na dowolne MHz (takze poza zakresem VCO)
+    long mhz = 0, off = 0;
+    const int s1 = arg.indexOf(' ');
+    String so = s1 < 0 ? String("0") : arg.substring(s1 + 1);
+    const bool neg = so.startsWith("-");
+    if (s1 < 0 || !parseArg(arg.substring(0, s1), 100, 8000, mhz) ||
+        !parseArg(neg ? so.substring(1) : so, 0, 30000, off)) {
+      Serial.println(F("ERR PLL mhz 100..8000 off [-]0..30000 (1/1024 MHz)"));
+      return;
+    }
+    const uint32_t t0 = micros();
+    set_rf_freq_offset(chip6_phy_init_ctrl[1], mhz, neg ? -off : off);
+    rxOffSet = true;
+    Serial.printf("PLL %ld MHz %+ld, %lu us, 98/7=0x%02X\r\n", mhz, neg ? -off : off,
+                  (unsigned long)(micros() - t0), i2c_rd(98, 1, 7));
+  } else if (name == "IQLIF") {
+    // "IQLIF f [if_Hz [D]]": f jak w IQSTREAM (kanal albo MHz)
+    long ifv = 100000, dec = 15;
+    uint32_t f = 0;
+    int s1 = arg.indexOf(' ');
+    const String a0 = s1 < 0 ? arg : arg.substring(0, s1);
+    String rest = s1 < 0 ? String() : arg.substring(s1 + 1);
+    bool ok = parseRxFreq(a0, f);
+    if (ok && rest.length()) {
+      const int s2 = rest.indexOf(' ');
+      String si = s2 < 0 ? rest : rest.substring(0, s2);
+      const bool neg = si.startsWith("-");
+      ok = parseArg(neg ? si.substring(1) : si, 20000, 400000, ifv);
+      if (neg) ifv = -ifv;
+      if (ok && s2 > 0) ok = parseArg(rest.substring(s2 + 1), 4, 64, dec);
+    }
+    if (!ok) {
+      Serial.println(F("ERR IQLIF f [if 20000..400000 Hz, +-] [D 4..64]"));
+      return;
+    }
+    iqLif(f, (int32_t)ifv, (uint32_t)dec);
+  } else if (name == "IQT") {
+    long n = 0, v = 0;
+    const int s1 = arg.indexOf(' ');
+    if (s1 < 0 || !parseArg(arg.substring(0, s1), 0, 32767, n) ||
+        !parseArg(arg.substring(s1 + 1), 0, 2, v)) {
+      Serial.println(F("ERR IQT n 0..32767 wariant 0..2"));
+      return;
+    }
+    iqTest((uint32_t)n, (uint32_t)v);
+  } else if (name == "GAIN") {
+    long rf = 0, bb = 0;
+    const int s1 = arg.indexOf(' ');
+    if (arg == "AGC") {
+      rxGain(-1, 0);
+    } else if (s1 > 0 && parseArg(arg.substring(0, s1), 0, 6, rf) &&
+               parseArg(arg.substring(s1 + 1), 0, 7, bb)) {
+      rxGain(rf, bb);
+    } else {
+      Serial.println(F("ERR GAIN AGC | GAIN rf 0..6 vga 0..7"));
+      return;
+    }
+    Serial.printf("GAIN %s\r\n", arg.c_str());
+  } else if (name == "PB") {
+    // eksperyment: PBUS przez ROM. "PB ENTER" / "PB EXIT" / "PB sel bank val" (val 0..511)
+    using V0 = void(*)(void);
+    using V3 = void(*)(uint32_t, uint32_t, uint32_t);
+    if (arg == "ENTER") {
+      reinterpret_cast<V0>(0x4000737Cu)();   // rom_pbus_debugmode (RX zostaje wlaczony)
+    } else if (arg == "DUMP") {
+      using R2 = uint32_t(*)(uint32_t, uint32_t);
+      for (uint32_t sel = 0; sel < 8; ++sel) {
+        Serial.printf("PBUS %lu:", (unsigned long)sel);
+        for (uint32_t bank = 0; bank < 4; ++bank)
+          Serial.printf(" %03lX", (unsigned long)reinterpret_cast<R2>(0x400074D8u)(sel, bank));  // rom_pbus_rd
+        Serial.println();
+      }
+    } else if (arg == "EXIT") {
+      reinterpret_cast<V0>(0x40007448u)();   // rom_pbus_exit_debugmode
+    } else {
+      long v[3];
+      int pos = 0;
+      for (int k = 0; k < 3; ++k) {
+        int e = arg.indexOf(' ', pos);
+        if (e < 0) e = arg.length();
+        if (!parseArg(arg.substring(pos, e), 0, 511, v[k])) {
+          Serial.println(F("ERR PB ENTER | EXIT | sel 0..7 bank 0..3 val 0..511"));
+          return;
+        }
+        pos = e + 1;
+      }
+      reinterpret_cast<V3>(0x4000747Cu)(v[0] & 7, v[1] & 3, v[2]);  // rom_pbus_force_test
+    }
+    Serial.printf("PB OK %08lX\r\n", (unsigned long)rd32(PBUS_CMD));
+  } else if (name == "RD" || name == "WR") {
+    // eksperyment: rejestry 0x6000xxxx, "RD adr" / "WR adr wartosc" (hex)
+    const int s1 = arg.indexOf(' ');
+    char* e = nullptr;
+    const uint32_t adr = strtoul(arg.substring(0, s1 < 0 ? arg.length() : s1).c_str(), &e, 16);
+    if ((adr & 0xFFFF0003u) != 0x60000000u || (name == "WR" && s1 < 0)) {
+      Serial.println(F("ERR RD adr | WR adr val (hex, 0x6000xxxx)"));
+      return;
+    }
+    const uint32_t old = rd32(adr);
+    if (name == "WR") wr32(adr, strtoul(arg.substring(s1 + 1).c_str(), nullptr, 16));
+    Serial.printf("REG %08lX = %08lX -> %08lX\r\n", (unsigned long)adr, (unsigned long)old,
+                  (unsigned long)rd32(adr));
   } else if (name == "IQ") {
     long n = 0, md = 0;
     uint32_t f = 0;
     const int s1 = arg.indexOf(' '), s2 = arg.lastIndexOf(' ');
-    if (s1 < 0 || s2 <= s1 || !parseRxFreq(arg.substring(0, s1), f) ||
-        !parseArg(arg.substring(s1 + 1, s2), 1, 32767, n) ||
+    if (s1 < 0 || s2 <= s1 || !(arg.substring(0, s1) == "0" || parseRxFreq(arg.substring(0, s1), f)) ||
+        !parseArg(arg.substring(s1 + 1, s2), 0, 32767, n) ||
         !parseArg(arg.substring(s2 + 1), 0, 1, md)) {
-      Serial.println(F("ERR IQ f (kanal 1..14 albo MHz) n 1..32767 tryb 0..1"));
+      Serial.println(F("ERR IQ f (kanal 1..14, MHz albo 0 = bez strojenia) n 0..32767 tryb 0..1"));
       return;
     }
     iqCapture(f, (uint32_t)n, (uint32_t)md);
