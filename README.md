@@ -1,4 +1,4 @@
-# ESP8266 SSB transmitter on 2.4 GHz
+# ESP8266 SSB transceiver on 2.4 GHz
 
 A bare ESP8266 transmits SSB voice (USB/LSB) on 2.4 GHz with no extra RF
 hardware. It drives the PHY's internal test-tone generator directly through
