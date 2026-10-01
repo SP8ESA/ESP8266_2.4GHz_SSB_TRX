@@ -32,6 +32,8 @@
     USB f       SSB gorna wstega, f = czestotliwosc (wytlumionej) nosnej
     LSB f       SSB dolna wstega; USB/LSB ON/OFF jak przy FM/AM
     CAL AM|DLY  sygnaly kalibracyjne pod SSB (AM-AM/AM-PM, opoznienie)
+    IQ f n t    odbior: 1024 probki IQ, f = kanal 1..14 albo MHz (2300..2600)
+    IQSTREAM f k t  odbior: ciagly strumien IQ 2 Mbaud (audio/rx_iq.py)
     STATUS, ?   stan i pomoc
 
   Sweep zmienia tylko pole K w slocie tonu (K ze znakiem, ~78.125 kHz/kod
@@ -244,9 +246,12 @@ static bool phyStart() {
   return true;
 }
 
+static void rxUntune();
+
 static bool txStart() {
   if (txOn) return true;
   if (!phyStart()) return false;
+  rxUntune();
   enterManual();
   if (!txPathOn()) {
     leaveManual();
@@ -770,6 +775,147 @@ static void streamRun(uint32_t fkhz) {
                 (unsigned long)stUnder, (unsigned long)stFifo);
 }
 
+// ---------------------------------------------------------------- RX IQ
+// Odbior przez estymator IQ odbiornika (ROM: rom_iq_est_enable/disable,
+// sterowanie 0x6000057C, bit31 = gotowe). Po n+1 probkach ADC rejestry
+// 0x600005DC/0x600005E0 trzymaja sumy I i Q (ze znakiem, << 6), 0x600005E4
+// moc. rom_dc_iq_est dzieli je przez n+1 - srednia zespolona okna, czyli
+// waskopasmowa probka IQ wokol LO. "IQ f n tryb" (f = kanal albo MHz): 1024 pomiary
+// z czasem w cyklach CPU do stBuf, potem binarnie: "IQDATA 1024\n" +
+// 1024 x (t u32, I i32, Q i32, P u32) LE.
+using IqEnFn  = void(*)(uint32_t, uint32_t);
+using IqDisFn = void(*)(void);
+static IqEnFn  iq_est_enable  = reinterpret_cast<IqEnFn>(0x40006430u);
+static IqDisFn iq_est_disable = reinterpret_cast<IqDisFn>(0x40006400u);
+static constexpr uint32_t IQ_SUM_I = 0x600005DCu;
+static constexpr uint32_t IQ_SUM_Q = 0x600005E0u;
+static constexpr uint32_t IQ_POW   = 0x600005E4u;
+static constexpr uint16_t IQ_N     = ST_BUF / 4;
+
+// Strojenie poza srodki kanalow (libphy.a, SDK 2.2.x): set_rf_freq_offset
+// (xtal, MHz, off) liczy PLL na MHz + off/1024 (ram_rfpll_set_freq: F =
+// 0.75 * xtal * (N + frac/65536)), wpisuje SDM i czeka na kalibracje PLL.
+// xtal: 0 = 40, 1 = 26, 2 = 24 MHz (chip6_phy_init_ctrl[1]). Oficjalna
+// sciezka chip_v6_set_chan_offset sie nie nadaje: chip_60_set_channel obcina
+// offset do +-300 (~293 kHz) i zeruje go, gdy freq_correct_en w init data
+// jest wylaczone (domyslnie). Najpierw kanal (kalibracje RX dla najblizszego
+// srodka), potem PLL; txStart wraca na srodek kanalu (rxUntune).
+extern "C" void set_rf_freq_offset(int xtal, int mhz, int off);
+extern "C" uint8_t chip6_phy_init_ctrl[];
+static bool rxOffSet = false;
+
+static void rxUntune() {
+  if (!rxOffSet) return;
+  set_rf_freq_offset(chip6_phy_init_ctrl[1], chMHz(gChannel), 0);
+  rxOffSet = false;
+}
+
+// najblizszy kanal 1..13 (14 blokuje domyslny kraj) + offset PLL; wypisuje
+// "RXF <Hz> CH <n> OFF <off>"
+static bool rxTune(uint32_t fkhz) {
+  const uint8_t ch = (uint8_t)constrain(((int32_t)fkhz - 2407000 + 2500) / 5000, 1, 13);
+  const int32_t d = (int32_t)fkhz - chMHz(ch) * 1000;
+  const int32_t off = (d * 1024 + (d < 0 ? -500 : 500)) / 1000;
+  if (!phyStart() || !setChannel(ch)) return false;
+  set_rf_freq_offset(chip6_phy_init_ctrl[1], chMHz(ch), off);
+  rxOffSet = off != 0;
+  Serial.printf("RXF %lu CH %u OFF %ld\r\n",
+                (unsigned long)(chMHz(ch) * 1000000u + (int32_t)(off * 1000000LL / 1024)),
+                ch, (long)off);
+  return true;
+}
+
+// "ch" 1..14 (srodek kanalu) albo czestotliwosc w MHz, np. 2414.5
+static bool parseRxFreq(const String& s, uint32_t& fkhz) {
+  long ch = 0;
+  if (parseArg(s, 1, 14, ch)) {
+    fkhz = (uint32_t)chMHz((uint8_t)ch) * 1000u;
+    return true;
+  }
+  return parseKHz(s, fkhz);
+}
+
+static void iqCapture(uint32_t fkhz, uint32_t n, uint32_t mode) {
+  txStop();
+  modeStop();
+  if (!rxTune(fkhz)) {
+    Serial.println(F("ERR TUNE"));
+    return;
+  }
+  delay(20);
+  const uint32_t ps = xt_rsil(15);
+  for (uint16_t i = 0; i < IQ_N; ++i) {
+    iq_est_enable(mode, n);
+    stBuf[4 * i]     = ESP.getCycleCount();
+    stBuf[4 * i + 1] = rd32(IQ_SUM_I);
+    stBuf[4 * i + 2] = rd32(IQ_SUM_Q);
+    stBuf[4 * i + 3] = rd32(IQ_POW);
+    iq_est_disable();
+  }
+  xt_wsr_ps(ps);
+  Serial.printf("IQDATA %u\n", IQ_N);
+  Serial.write(reinterpret_cast<const uint8_t*>(stBuf), sizeof(stBuf));
+  Serial.flush();
+  Serial.println();
+}
+
+// "IQSTREAM f k tryb": ciagly odbior, okno n+1 = 2^k probek ADC (40 MS/s),
+// srednia I/Q = suma >> k jako i16. UART na ST_BAUD; co 16 probek naglowek
+// A5 5A + ccount 24 bity LE (z niego PC liczy fs i uklada paczki na osi
+// czasu), potem 16 x (I, Q) i16 LE. Male paczki: zgubiony bajt (CH340) psuje
+// tylko 16 probek. Gdy FIFO nie ma miejsca, czeka (licznik przestojow).
+// Dowolny bajt od PC konczy strumien (powrot na 115200 + podsumowanie).
+static void iqStream(uint32_t fkhz, uint32_t k, uint32_t mode) {
+  txStop();
+  modeStop();
+  if (!rxTune(fkhz)) {
+    Serial.println(F("ERR TUNE"));
+    return;
+  }
+  const uint32_t n = (1u << k) - 1;
+  Serial.printf("OK IQSTREAM %lu\r\n", (unsigned long)ST_BAUD);
+  Serial.flush();
+  delay(20);
+  Serial.updateBaudRate(ST_BAUD);
+  // 2 bity stopu: ciagly strumien 1-bitowy CH340 gubil co ~7 kB bajt
+  USC0(0) = (USC0(0) & ~(3u << UCSBN)) | (3u << UCSBN);
+  delay(20);
+  while (Serial.available()) Serial.read();
+
+  uint32_t samples = 0, stalls = 0;
+  const uint32_t ps = xt_rsil(15);
+  for (uint32_t i = 0;; ++i) {
+    iq_est_enable(mode, n);
+    const int32_t si = (int32_t)rd32(IQ_SUM_I) >> k;
+    const int32_t sq = (int32_t)rd32(IQ_SUM_Q) >> k;
+    iq_est_disable();
+    const int16_t vi = (int16_t)constrain(si, -32768, 32767);
+    const int16_t vq = (int16_t)constrain(sq, -32768, 32767);
+    const bool head = (i & 15) == 0;
+    const uint32_t need = head ? 9 : 4;
+    if (128 - ((USS(0) >> USTXC) & 0xFF) < need) {
+      ++stalls;
+      while (128 - ((USS(0) >> USTXC) & 0xFF) < need) {}
+    }
+    if (head) {
+      const uint32_t t = ESP.getCycleCount();
+      USF(0) = 0xA5; USF(0) = 0x5A;
+      USF(0) = t; USF(0) = t >> 8; USF(0) = t >> 16;
+    }
+    USF(0) = vi; USF(0) = vi >> 8; USF(0) = vq; USF(0) = vq >> 8;
+    ++samples;
+    if ((i & 1023) == 0) ESP.wdtFeed();
+    if ((USS(0) >> USRXC) & 0xFF) break;  // PC konczy
+  }
+  xt_wsr_ps(ps);
+  delay(50);
+  USC0(0) = (USC0(0) & ~(3u << UCSBN)) | (1u << UCSBN);
+  Serial.updateBaudRate(115200);
+  while (Serial.available()) Serial.read();
+  Serial.printf("IQSTREAM END probek=%lu przestojow_fifo=%lu\r\n",
+                (unsigned long)samples, (unsigned long)stalls);
+}
+
 // ---------------------------------------------------------------- Morse
 
 static const char* morse(char c) {
@@ -890,6 +1036,7 @@ static void printHelp() {
   Serial.println(F("USB f | LSB f (MHz, czestotliwosc nosnej) | USB/LSB ON | OFF"));
   Serial.println(F("CAL AM | CAL DLY | CAL OFF (pomiar toru pod SSB)"));
   Serial.println(F("STREAM f (MHz) - SSB z probek z PC przez USB (audio/stream_ssb.py)"));
+  Serial.println(F("IQ f n tryb | IQSTREAM f k tryb - odbior IQ, f = kanal albo MHz (audio/rx_iq.py)"));
 }
 
 static bool parseArg(const String& s, long lo, long hi, long& out) {
@@ -1041,6 +1188,28 @@ static void handle(String cmd) {
     gDepth = (uint8_t)v;
     if (mode == MODE_AM) audioStart(MODE_AM);
     printStatus();
+  } else if (name == "IQ") {
+    long n = 0, md = 0;
+    uint32_t f = 0;
+    const int s1 = arg.indexOf(' '), s2 = arg.lastIndexOf(' ');
+    if (s1 < 0 || s2 <= s1 || !parseRxFreq(arg.substring(0, s1), f) ||
+        !parseArg(arg.substring(s1 + 1, s2), 1, 32767, n) ||
+        !parseArg(arg.substring(s2 + 1), 0, 1, md)) {
+      Serial.println(F("ERR IQ f (kanal 1..14 albo MHz) n 1..32767 tryb 0..1"));
+      return;
+    }
+    iqCapture(f, (uint32_t)n, (uint32_t)md);
+  } else if (name == "IQSTREAM") {
+    long k = 0, md = 0;
+    uint32_t f = 0;
+    const int s1 = arg.indexOf(' '), s2 = arg.lastIndexOf(' ');
+    if (s1 < 0 || s2 <= s1 || !parseRxFreq(arg.substring(0, s1), f) ||
+        !parseArg(arg.substring(s1 + 1, s2), 5, 14, k) ||
+        !parseArg(arg.substring(s2 + 1), 0, 1, md)) {
+      Serial.println(F("ERR IQSTREAM f (kanal 1..14 albo MHz) k 5..14 tryb 0..1"));
+      return;
+    }
+    iqStream(f, (uint32_t)k, (uint32_t)md);
   } else if (name == "STREAM") {
     uint32_t f = gModKHz;
     if (arg.length() && !parseKHz(arg, f)) {

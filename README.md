@@ -21,6 +21,10 @@ transmitting.
 | `CW_CARRIER_TEST/audio/ssb_dsp.py` | DSP: speech processor, analytic signal, envelope/frequency split |
 | `CW_CARRIER_TEST/audio/make_audio_h.py` | builds `ssb_data.h` / `audio_data.h` from an audio file |
 | `CW_CARRIER_TEST/audio/sp8esa.mp3` | test recording |
+| `CW_CARRIER_TEST/audio/esp_sdr.py` | receiver: spectrum, waterfall and USB/LSB demodulator using the ESP as an IQ receiver |
+| `CW_CARRIER_TEST/audio/rx_iq.py` | receiver: raw IQ capture from the ESP to WAV / cs16 |
+| `CW_CARRIER_TEST/audio/hackrf_ssb_tx.py` | SSB test signal from a HackRF, looped (for testing the receiver) |
+| `ODBIORNIK_IQ.md` | receiver notes in Polish: registers, ROM/libphy functions, measurements |
 
 ## Requirements
 
@@ -121,6 +125,25 @@ few ppm, which is a few kHz at 2.4 GHz.
   u8, frequency i16 LE in Q16 K units), then an XOR checksum. The ESP
   buffers 4096 samples (128 ms) and reports its fill level back so the
   PC can pace the stream.
+
+## Receiver (experimental)
+
+The ESP8266 also works as a narrowband IQ receiver. The hardware DC/IQ
+estimator of the Wi-Fi receiver (normally used for calibration) averages
+2^k ADC samples (40 MS/s); repeating it gives complex samples at about
+35.7 kS/s (k=10), streamed over USB at 2 Mbaud (`IQSTREAM f k mode`). The
+LO can be set anywhere from 2300 to 2600 MHz in 1/1024 MHz steps: nearest
+Wi-Fi channel plus a fractional-N PLL offset (`set_rf_freq_offset` from
+`libphy.a`). `esp_sdr.py` shows the spectrum and waterfall and demodulates
+USB/LSB with sound; click the spectrum to tune. It needs PyQt5, pyqtgraph
+and sounddevice in addition to the requirements above. Details and
+measurements (in Polish): `ODBIORNIK_IQ.md`.
+
+```sh
+cd CW_CARRIER_TEST/audio
+python3 hackrf_ssb_tx.py &       # optional test signal: USB on 2400.250 MHz
+python3 esp_sdr.py --f 2400.250
+```
 
 ## Limitations
 
