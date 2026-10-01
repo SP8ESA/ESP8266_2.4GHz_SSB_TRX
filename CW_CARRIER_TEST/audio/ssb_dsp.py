@@ -5,19 +5,16 @@ Uzywane przez make_audio_h.py (tablice we flashu) i stream_ssb.py (probki
 pchane przez USB).
 
 Obwiednia: ASK w Q8 (0 = szczyt, 127*256 = podloga ~-31 dB, 128*256 =
-bramka OFF), wg zmierzonej krzywej toru ASK (ask_cal.json z cal_hackrf.py).
-Czestotliwosc: chwilowa czestotliwosc USB jako offset K w Q16 (1 kod =
-78.125 kHz), minus zmierzone AM-PM i AM-FM toru ASK; LSB = minus to samo.
+bramka OFF), wg nominalnego prawa tlumika (DB_PER_ASK na krok), bez
+predystorsji. Czestotliwosc: chwilowa czestotliwosc USB jako offset K w Q16
+(1 kod = 78.125 kHz); LSB = minus to samo.
 """
-import json
 import subprocess
 import wave
-from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import maximum_filter1d
-from scipy.signal import (filtfilt, firwin, firwin2, hilbert, lfilter,
-                          savgol_filter, welch)
+from scipy.signal import filtfilt, firwin, firwin2, hilbert, welch
 
 SSB_RATE = 32000
 DB_PER_ASK = 0.2429     # pomiar z repo (M-ASK reference), APWR 64
@@ -28,11 +25,14 @@ SSB_LO, SSB_HI = 200, 2800
 EQ_TILT = 1.5
 EQ_BOOST = 10.0
 # kompresja: AF ratio i prog [dB pod glosna mowa], RF (obwiednia SSB) ratio
-# i sufit limitera [percentyl |z|, 100 = brak]
-COMP = {"soft": (3, 20, 2, 100.0), "mid": (6, 25, 4, 98.0), "hard": (8, 30, 6, 95.0)}
+# i sufit limitera [percentyl |z|, 100 = brak], sufit limitera AF [percentyl
+# |audio|], szczyt obwiedni = ASK 0 przy percentylu |z| (wyzej twarde ciecie)
+COMP = {"light": (3, 15, 1.5, 100.0, 99.9, 99.99),
+        "soft": (3, 20, 2, 100.0, 99, 99.9),
+        "mid": (6, 25, 4, 98.0, 99, 99.9),
+        "hard": (8, 30, 6, 95.0, 99, 99.9)}
 TRIM = ("silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
         "silenceremove=start_periods=1:start_threshold=-45dB,areverse")
-CAL = Path(__file__).resolve().parent / "ask_cal.json"
 
 
 def load_audio(src, rate, extra_af="", trim=True):
@@ -65,17 +65,6 @@ def smooth(v, fs, ms):
     return np.convolve(v, np.ones(n) / n, "same")
 
 
-def speech_gate(xe, fs):
-    """Maska mowy (0..1) liczona offline, wiec moze patrzec w obie strony:
-    prog 10 dB nad szumem tla nagrania, maska poszerzona o +-40 ms (bez
-    obcinania poczatkow i koncowek slow), zbocza 10 ms. Nakladana na samym
-    koncu, zeby zadna kompresja nie podniosla tla w pauzach."""
-    lvl = 10 * np.log10(smooth(xe * xe, fs, 20) + 1e-20)
-    thr = min(np.percentile(lvl, 90) - 20, np.percentile(lvl, 3) + 10)
-    mask = maximum_filter1d((lvl > thr).astype(float), size=int(0.08 * fs) + 1)
-    return smooth(mask, fs, 10)
-
-
 def limiter(v, fs, ceil, look_ms=5, rel_ms=60):
     """Limiter z wyprzedzeniem: wzmocnienie schodzi plynnie juz przed szczytem
     i wraca w rel_ms - nic nie jest obcinane (clippery dawaly charczenie)."""
@@ -106,15 +95,16 @@ def speech_eq(x, fs, tilt=EQ_TILT):
 def speech_proc(x, fs, comp="mid", tilt=EQ_TILT):
     """Procesor mowy: auto-EQ, kompresor (detektor RMS 10 / 150 ms, wolniejszy
     niz okres tonu krtaniowego, wzmocnienie wygladzone), limiter z
-    wyprzedzeniem zamiast clippera. Zwraca (audio, maska mowy)."""
+    wyprzedzeniem zamiast clippera."""
     ratio, thr = COMP[comp][:2]
+    lim = COMP[comp][4]
     xe = speech_eq(x, fs, tilt)
     lv = 10 * np.log10(follow(xe * xe, 0.010, 0.150, fs) + 1e-20)
     T = np.percentile(lv, 90) - thr
     gdb = np.where(lv > T, (T + (lv - T) / ratio) - lv, 0.0)
     y = xe * 10 ** (smooth(gdb, fs, 5) / 20)
     y /= np.percentile(np.abs(y), 99.9)
-    return limiter(y, fs, np.percentile(np.abs(y), 99)), speech_gate(xe, fs)
+    return limiter(y, fs, np.percentile(np.abs(y), lim))
 
 
 def rf_proc(z, fs, bpf, comp="mid"):
@@ -122,7 +112,7 @@ def rf_proc(z, fs, bpf, comp="mid"):
     wzmocnienie wygladzone) i limiter obwiedni z wyprzedzeniem, potem
     ponowny filtr pasma i Hilbert. Mniej czasu przy podlodze -31 dB i
     nizszy PAPR = wiecej sredniej mocy."""
-    ratio, clip = COMP[comp][2:]
+    ratio, clip = COMP[comp][2:4]
     a = np.abs(z)
     e = follow(a, 0.010, 0.100, fs)
     T = np.percentile(e, 95) * 10 ** (-18 / 20)
@@ -141,41 +131,22 @@ def analytic(x, fs=SSB_RATE, comp="mid", raw=False, tilt=EQ_TILT):
     if raw:
         z = hilbert(x_raw)
     else:
-        y, gate = speech_proc(x, fs, comp, tilt)
-        z = rf_proc(hilbert(filtfilt(bpf, 1, y)), fs, bpf, comp) * gate  # pauzy = cisza
-    z /= np.percentile(np.abs(z), 99.9)
+        y = speech_proc(x, fs, comp, tilt)
+        z = rf_proc(hilbert(filtfilt(bpf, 1, y)), fs, bpf, comp)
+    z /= np.percentile(np.abs(z), 99.9 if raw else COMP[comp][5])
     return z, x_raw, z.real
 
 
-def load_cal(no_amfm=False, log=print):
-    """Krzywe toru ASK: amplituda (liniowo), AM-PM [rad], AM-FM [Hz], tau AM-FM."""
+def ask_curve():
+    """Nominalna krzywa tlumika ASK: poziomy 0..127 i amplituda liniowa."""
     levels = np.arange(128)
-    if not CAL.exists():
-        log("ssb: brak ask_cal.json - prawo z repo, bez korekcji AM-PM")
-        return dict(levels=levels, amp_lin=10 ** (-DB_PER_ASK * levels / 20),
-                    ampm=np.zeros(128), amfm=np.zeros(128), amfm_tau=0.0)
-    j = json.loads(CAL.read_text())
-    amp_db = savgol_filter(np.array(j["amp_db"][:128]), 9, 2)
-    amp_db = np.minimum.accumulate(amp_db - amp_db[0])  # malejaca od 0 dB
-    if "ampm_step_deg" in j:  # skok fazy na krawedzi (bez udzialu AM-FM)
-        ampm = np.polyval(np.polyfit(j["amfm_levels"], j["ampm_step_deg"], 2), levels)
-    else:
-        ampm = np.polyval(np.polyfit(levels, np.array(j["phase_deg"][:128]), 3,
-                                     w=10 ** (amp_db / 20)), levels)
-    ampm = np.radians(ampm - ampm[0])
-    # AM->FM: czestotliwosc wyjscia spada do ~-70 Hz przy nizszym poziomie,
-    # z opoznieniem 1 rzedu - kompensowane w tablicy czestotliwosci
-    amfm = np.array(j["amfm_hz"]) - j["amfm_hz"][0] if "amfm_hz" in j else np.zeros(128)
-    if no_amfm:
-        amfm = np.zeros(128)
-    log(f"ssb: krzywa z {CAL.name} ({j.get('esp_cmds')}), zakres {amp_db[-1]:.1f} dB, "
-        f"AM-PM do {np.degrees(ampm).max():+.1f} deg, AM-FM do {amfm.min():+.0f} Hz")
-    return dict(levels=levels, amp_lin=10 ** (amp_db / 20), ampm=ampm, amfm=amfm,
-                amfm_tau=j.get("amfm_tau_ms", 0.0) * 1e-3)
+    return dict(levels=levels, amp_lin=10 ** (-DB_PER_ASK * levels / 20))
 
 
-def polar(z, cal, fs=SSB_RATE, phase_only=False, env_only=False, log=print):
-    """Sygnal analityczny -> (env_q8 uint16, freq_q16 int16) dla modulatora."""
+def polar(z, cal, fs=SSB_RATE, phase_only=False, env_only=False, log=print, gate_ms=5):
+    """Sygnal analityczny -> (env_q8 uint16, freq_q16 int16) dla modulatora.
+    gate_ms: bramka OFF dopiero przy obwiedni pod podloga dluzej niz tyle ms;
+    0 = nigdy (pauzy i dolki zostaja na podlodze -31 dB)."""
     levels, amp_lin = cal["levels"], cal["amp_lin"]
     # obwiednia na srodku probki (ZOH amplitudy trwa [n, n+1)); ASK n/n+1 jest
     # ditherowane, wiec srednia amplituda jest liniowa miedzy punktami krzywej
@@ -184,29 +155,27 @@ def polar(z, cal, fs=SSB_RATE, phase_only=False, env_only=False, log=print):
     ask = np.interp(env, amp_lin[::-1], levels[::-1].astype(float))
     if phase_only:   # diagnostyka: stala obwiednia, sama faza
         ask = np.zeros_like(ask)
-    env_q8 = np.clip(np.round(ask * 256), 0, 127 * 256).astype(np.uint16)
+    # max ASK 126.5, nie 127: ditherBurst miesza an z an+1, a przy an = 127
+    # an+1 = 128 to bramka OFF - resztka bledu ditheringu przy wejsciu na
+    # podloge wylaczala bramke na chwile, a kazde wlaczenie bramki to losowa
+    # faza nosnej (gate_test.py) -> trwale skoki fazy = trzeszczenie
+    env_q8 = np.clip(np.round(ask * 256), 0, 126.5 * 256).astype(np.uint16)
     # pauzy: obwiednia ponizej podlogi dluzej niz 5 ms -> bramka OFF (128), z 1 ms
     # marginesu na podlodze po obu stronach (szybko przelaczana bramka nie dziala)
     quiet = np.abs(zm) < amp_lin[-1]
     edges = np.flatnonzero(np.diff(np.concatenate(([0], quiet.astype(int), [0]))))
     gated = 0
     for a, b in zip(edges[0::2], edges[1::2]):
-        if b - a >= fs * 5 // 1000:
+        if gate_ms and b - a >= fs * gate_ms / 1000:
             m = fs // 1000
             env_q8[a + m:b - m] = 128 * 256
             gated += b - a - 2 * m
     log(f"ssb: bramka OFF w pauzach przez {gated / fs * 1000:.0f} ms "
         f"({gated / len(env_q8) * 100:.0f}% czasu)")
-    # czestotliwosc z przyrostu fazy minus AM-PM i AM-FM toru, kwantyzacja ze
-    # sprzezeniem bledu: faza koncowa trafia co do Q16, bez dryfu
+    # czestotliwosc z przyrostu fazy, kwantyzacja ze sprzezeniem bledu:
+    # faza koncowa trafia co do Q16, bez dryfu
     phase = np.unwrap(np.angle(z))
-    phase[1:] -= np.interp(ask, levels, cal["ampm"])
     qf = np.diff(phase) * fs / (2 * np.pi * HZ_PER_CODE) * 65536
-    fam = np.interp(ask, levels, cal["amfm"])
-    if cal["amfm_tau"] > 0:  # ten sam filtr 1 rzedu co w ESP (tau ~0.27 ms)
-        al = 1 - np.exp(-1 / (cal["amfm_tau"] * fs))
-        fam = lfilter([al], [1, al - 1], fam, zi=[fam[0] * (1 - al)])[0]
-    qf -= fam / HZ_PER_CODE * 65536
     assert np.abs(qf).max() < 32767
     cum = np.round(np.cumsum(qf)).astype(np.int64)
     freq_q16 = np.diff(np.concatenate(([0], cum))).astype(np.int16)

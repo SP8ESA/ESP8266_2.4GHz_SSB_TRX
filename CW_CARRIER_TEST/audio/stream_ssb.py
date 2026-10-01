@@ -7,12 +7,17 @@ Uzycie: python3 stream_ssb.py plik.wav [plik2 ...] [--freq 2402] [--lsb]
           sine:F[:S]   ton F Hz przez tor DSP (S sekund, domyslnie 1)
           cw:F[:S]     stala czestotliwosc F Hz jako sam dithering K, bez DSP
           silence:S    cisza (bramka OFF)
-            [--comp soft|mid|hard] [--raw] [--gap 1.0] [--seconds N]
+          twotone[:F1:F2]  dwa rowne tony (domyslnie 700 i 1900 Hz), PEP = ASK 0,
+                       bez procesora mowy, petla 1 s (z --gap 0 bez szwu)
+          noise[:S]    bialy szum w pasmie SSB_LO..SSB_HI, bez procesora mowy
+                       (S sekund, domyslnie 4; okresowy - z --gap 0 bez szwu)
+            [--comp light|soft|mid|hard] [--raw] [--gap 1.0] [--seconds N]
+            [--gate 5] (ms pod podloga do wylaczenia bramki, 0 = nigdy)
             [--port /dev/ttyUSB0]
 
 Pliki graja w petli (z przerwa --gap s) do Ctrl-C albo --seconds. DSP jak
 dla flasha (ssb_dsp.py): procesor mowy, sygnal analityczny, obwiednia i
-czestotliwosc z predystorsja z ask_cal.json.
+czestotliwosc chwilowa.
 
 Protokol: ESP po "STREAM f" odpowiada "OK STREAM 2000000" i przechodzi na
 2 Mbaud. Pakiet: A5 5A, 64 x (obwiednia u8: ASK w 0.5 kroku, 255 = bramka
@@ -50,14 +55,23 @@ def main():
     ap.add_argument("files", nargs="+")
     ap.add_argument("--freq", default="2402")
     ap.add_argument("--lsb", action="store_true")
-    ap.add_argument("--comp", default="mid", choices=list(d.COMP))
+    ap.add_argument("--comp", default="light", choices=list(d.COMP))
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--gap", type=float, default=1.0)
+    ap.add_argument("--gate", type=float, default=5)
     ap.add_argument("--seconds", type=float, default=0)
     ap.add_argument("--port", default="/dev/ttyUSB0")
     a = ap.parse_args()
 
-    cal = d.load_cal()
+    blocks = build(a, d.ask_curve())
+    period = len(blocks) * BLOCK / d.SSB_RATE
+    print(f"petla {period:.2f} s, {len(blocks)} pakietow, "
+          f"{'LSB' if a.lsb else 'USB'} {a.freq} MHz")
+    send(blocks, a.freq, a.port, a.seconds)
+
+
+def build(a, cal):
+    """Pliki/zrodla z linii komend -> lista pakietow."""
     blocks = []
     gap = int(a.gap * d.SSB_RATE)
     for fn in a.files:
@@ -67,6 +81,26 @@ def main():
         if kind == "cw":         # sam dithering K: stala czestotliwosc, bez DSP
             env_q8 = np.zeros(n, np.uint16)
             freq_q16 = np.full(n, round(float(par[0]) * 65536 / d.HZ_PER_CODE), np.int16)
+        elif kind == "noise":    # bialy szum w pasmie mowy: pomiar produktow obcych
+            n = int(round((float(par[0]) if par else 4.0) * d.SSB_RATE))
+            n += -n % BLOCK      # pelne pakiety: dopelnienie nie wstawi ciszy w petle
+            rng = np.random.default_rng(1)
+            f = np.fft.fftfreq(n, 1 / d.SSB_RATE)
+            band = (f >= d.SSB_LO) & (f <= d.SSB_HI)   # tylko dodatnie = USB
+            Z = np.zeros(n, complex)
+            Z[band] = np.exp(2j * np.pi * rng.random(band.sum()))
+            z = np.fft.ifft(Z)                          # okresowy, z[n] == z[0]
+            z /= np.percentile(np.abs(z), 99.9)         # szczyt ASK 0, 0.1% przyciete
+            print(f"noise: {n / d.SSB_RATE:.2f} s, srednia moc "
+                  f"{10 * np.log10(np.mean(np.abs(z) ** 2)):.1f} dB wzgl. szczytu")
+            env_q8, freq_q16 = d.polar(np.append(z, z[0]), cal, gate_ms=a.gate)
+        elif kind == "twotone":  # test dwutonowy: IMD i produkty obce
+            f1, f2 = (round(float(par[0])), round(float(par[1]))) if len(par) >= 2 else (700, 1900)
+            n = d.SSB_RATE                             # 1 s: calkowita liczba okresow
+            t = np.arange(n + 1) / d.SSB_RATE
+            z = (np.exp(2j * np.pi * f1 * t) + np.exp(2j * np.pi * f2 * t)) / 2
+            print(f"twotone: {f1} + {f2} Hz, PEP = ASK 0, kazdy ton -6 dB wzgl. PEP")
+            env_q8, freq_q16 = d.polar(z, cal, gate_ms=a.gate)
         elif kind == "silence":  # bramka OFF
             n = int(round(float(par[0]) * d.SSB_RATE))
             env_q8 = np.full(n, 128 * 256, np.uint16)
@@ -77,22 +111,23 @@ def main():
                 z = np.exp(2j * np.pi * round(float(par[0])) * t)
             else:
                 z, _, _ = d.analytic(d.load_audio(fn, d.SSB_RATE), d.SSB_RATE, a.comp, a.raw)
-            env_q8, freq_q16 = d.polar(z, cal)
+            env_q8, freq_q16 = d.polar(z, cal, gate_ms=a.gate)
         env_q8 = np.concatenate((env_q8, np.full(gap, 128 * 256, np.uint16)))
         freq_q16 = np.concatenate((freq_q16, np.zeros(gap, np.int16)))
         blocks += stream_bytes(env_q8, freq_q16, a.lsb)
         print(f"{fn}: {len(env_q8) / d.SSB_RATE:.2f} s")
-    period = len(blocks) * BLOCK / d.SSB_RATE
-    print(f"petla {period:.2f} s, {len(blocks)} pakietow, "
-          f"{'LSB' if a.lsb else 'USB'} {a.freq} MHz")
+    return blocks
 
+
+def send(blocks, freq, port, seconds=0):
+    """Wlacza STREAM na ESP i pcha pakiety w petli do Ctrl-C albo seconds."""
     s = serial.Serial()
-    s.port, s.baudrate, s.timeout = a.port, 115200, 0.05
+    s.port, s.baudrate, s.timeout = port, 115200, 0.05
     s.dtr = s.rts = False
     s.open()                                   # reset ESP
     time.sleep(2.5)
     s.read(65536)
-    s.write(f"STREAM {a.freq}\r\n".encode())
+    s.write(f"STREAM {freq}\r\n".encode())
     buf, t0 = b"", time.time()
     while b"OK STREAM" not in buf and time.time() - t0 < 6:
         buf += s.read(4096)
@@ -108,7 +143,7 @@ def main():
     fmin, fmax, t_rep, sent_total = BUF, 0, time.time(), 0
     t_start = time.time()
     try:
-        while not a.seconds or time.time() - t_start < a.seconds:
+        while not seconds or time.time() - t_start < seconds:
             for b in s.read(s.in_waiting or 1):
                 if state == 0:
                     state = b == 0xB7
@@ -124,7 +159,7 @@ def main():
                 s.write(b"".join(chunk))
                 sent_total += len(chunk)
             if time.time() - t_rep > 2:
-                print(f"  bufor ESP {fmin}..{fmax}/{BUF} probek, wyslano {sent_total * BLOCK / d.SSB_RATE:.1f} s audio")
+                print(f"  bufor ESP {fmin}..{fmax}/{BUF} probek, wyslano {sent_total * BLOCK / d.SSB_RATE:.1f} s")
                 fmin, fmax, t_rep = BUF, 0, time.time()
     except KeyboardInterrupt:
         pass

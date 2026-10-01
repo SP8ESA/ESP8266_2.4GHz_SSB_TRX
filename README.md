@@ -18,9 +18,8 @@ transmitting.
 | `CW_CARRIER_TEST/CW_CARRIER_TEST.ino` | firmware: modulator, `STREAM` mode, SSB from flash, CW/FM/AM |
 | `CW_CARRIER_TEST/ssb_data.h`, `audio_data.h` | test recording in flash (SSB 32 kS/s, FM/AM 8 kS/s) |
 | `CW_CARRIER_TEST/audio/stream_ssb.py` | live SSB: audio files from the PC over USB |
-| `CW_CARRIER_TEST/audio/ssb_dsp.py` | DSP: speech processor, analytic signal, predistortion |
+| `CW_CARRIER_TEST/audio/ssb_dsp.py` | DSP: speech processor, analytic signal, envelope/frequency split |
 | `CW_CARRIER_TEST/audio/make_audio_h.py` | builds `ssb_data.h` / `audio_data.h` from an audio file |
-| `CW_CARRIER_TEST/audio/ask_cal.json` | measured TX path nonlinearity (AM-AM, AM-PM, AM-FM) |
 | `CW_CARRIER_TEST/audio/sp8esa.mp3` | test recording |
 
 ## Requirements
@@ -59,15 +58,27 @@ the files with a 1 s gap until Ctrl-C.
 |---|---|
 | `--freq` | carrier in MHz, 1 kHz resolution |
 | `--lsb` | lower sideband instead of upper |
-| `--comp` | speech processor strength (`soft`, `mid` (default), `hard`) |
+| `--comp` | speech processor strength (`light` (default), `soft`, `mid`, `hard`) |
 | `--raw` | band-pass filter only, no speech processor |
-| `--gap` | pause between files in seconds |
+| `--gap` | pause between files in seconds (`0` = seamless loop) |
+| `--gate` | ms below the ASK floor before the tone is gated off (`0` = never) |
 | `--seconds` | stop after N seconds |
 | `--port` | serial port |
 
-Apart from audio files, the script also accepts test sources:
-`sine:F[:S]` (tone through the DSP), `cw:F[:S]` (fixed frequency) and
-`silence:S`.
+Apart from audio files, the script also accepts test sources. These skip
+the speech processor; use them with `--gap 0` for continuous TX:
+
+| Source | Signal |
+|---|---|
+| `twotone[:F1:F2]` | two equal tones, 700 + 1900 Hz by default, peak envelope at full power (IMD test) |
+| `noise[:S]` | white noise in 200–2800 Hz, S-second loop (spurious emission test) |
+| `sine:F[:S]` | single tone |
+| `cw:F[:S]` | fixed frequency, constant envelope |
+| `silence:S` | gate off |
+
+```sh
+python3 stream_ssb.py twotone --gap 0 --freq 2402
+```
 
 **From flash, no PC needed:** send `USB 2402` or `LSB 2402` on the serial
 port, and `OFF` to stop. To put in your own recording, run
@@ -97,10 +108,12 @@ few ppm, which is a few kHz at 2.4 GHz.
   it. Fractional amplitude is dithered between ASK n and n+1. Streaming
   runs with interrupts disabled, because any stall shows up as a phase
   step.
-- **Predistortion:** `ask_cal.json` holds the ASK curve measured with a
-  HackRF (about 30.7 dB of range), AM-PM (up to +9°) and AM-FM (down to
-  −68 Hz, τ ≈ 0.27 ms). The DSP inverts all three. Below the ASK floor
-  (about −31 dB) for more than 5 ms, the gate switches the tone off.
+- **Envelope range:** ASK spans about 31 dB. Below that floor the envelope
+  is clipped, and after 5 ms below it the gate switches the tone off. The
+  floor is never dithered with the gate, because every gate turn-on starts
+  the tone with a random phase. There is no predistortion: a measured
+  AM-AM/AM-PM/AM-FM correction made the two-tone test worse, so the DSP
+  uses the nominal 0.24 dB/step law.
 - **DSP on the PC:** 200–2800 Hz band-pass, auto-EQ, compressor,
   look-ahead limiter and envelope compression, then `polar()` with
   error-feedback quantisation, so the phase does not drift.
@@ -109,21 +122,12 @@ few ppm, which is a few kHz at 2.4 GHz.
   buffers 4096 samples (128 ms) and reports its fill level back so the
   PC can pace the stream.
 
-## Measured results and limitations
-
-Measured with a HackRF on speech:
-
-- opposite sideband about −32 dB,
-- ±3.5–10 kHz from the carrier about −35 dB,
-- pauses about −50 dB.
-
-Limitations:
+## Limitations
 
 - In `STREAM` mode the USB-UART traffic adds sidebands at ±153 kHz, about
   −19 dB relative to the signal (weaker ones at ±51 and ±306 kHz).
   Playback from flash does not have them.
 - Sample images appear at ±32 kHz.
-- The calibration comes from a single board.
 
 ## Credits
 
