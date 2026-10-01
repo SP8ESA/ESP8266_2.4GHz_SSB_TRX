@@ -145,6 +145,26 @@ python3 hackrf_ssb_tx.py &       # optional test signal: USB on 2400.250 MHz
 python3 esp_sdr.py --f 2400.250
 ```
 
+## Screenshots
+
+ESP8266 transmitter, `STREAM` mode, USB on 2402.000 MHz, received with a
+HackRF One in SDR++ (test sources from `stream_ssb.py`, no speech
+processor). Polish captions: `zrzuty/OPIS.md`.
+
+| | |
+|---|---|
+| ![white noise, wide view](zrzuty/tx_szum_szeroko.png) | ![two-tone, wide view](zrzuty/tx_dwuton_szeroko.png) |
+| White noise in the SSB band (200–2800 Hz), wide view. Symmetric lines from CH340 UART traffic at ±153 kHz (weaker at ±51 and ±306 kHz). | Two-tone test (700 + 1900 Hz), same view. |
+| ![two-tone, close-up](zrzuty/tx_dwuton_zblizenie.png) | ![white noise, close-up](zrzuty/tx_szum_zblizenie.png) |
+| Two-tone close-up above the suppressed carrier. The weak line about 0.5 kHz below the carrier is most likely third-order IMD (2·f1 − f2). | White noise close-up: transmit passband shape and out-of-band level. |
+
+ESP8266 receiver (`esp_sdr.py`) demodulating `sp8esa.mp3` sent by a HackRF
+in USB on 2400.250 MHz. The red line is the receive frequency, the green
+area the 2.4 kHz USB filter; the line at 2400.245 MHz is the ESP LO (DC
+residue).
+
+![ESP8266 SDR receiving SSB](zrzuty/rx_esp_sdr_sp8esa.png)
+
 ## Limitations
 
 - In `STREAM` mode the USB-UART traffic adds sidebands at ±153 kHz, about

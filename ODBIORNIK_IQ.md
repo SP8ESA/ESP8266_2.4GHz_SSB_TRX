@@ -162,6 +162,10 @@ python3 rx_iq.py --f 2400.25 --k 10 --seconds 10 --dc         # LO poza kanałem
 - **Sprawdzone:** nagranie z `--wav` ma rozkład energii w pasmach zgodny
   z oryginałem co do ok. 1 dB, zgubione paczki 0.7%.
 
+![esp_sdr.py: odbiór sp8esa.mp3 z HackRF](zrzuty/rx_esp_sdr_sp8esa.png)
+
+Opisy wszystkich zrzutów: `zrzuty/OPIS.md`.
+
 ```sh
 python3 hackrf_ssb_tx.py &            # nadawanie testowe (SDR++ zamknięty)
 python3 esp_sdr.py                    # okno, start na 2400.250 MHz USB
